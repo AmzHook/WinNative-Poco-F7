@@ -1,0 +1,280 @@
+name: Build FEXCore-F7 v0.2
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-fexcore-f7-v0.2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # FEX-2609 annotated tag -> exact upstream commit
+  FEX_REF: "395b132f346b1a45def246d10c52245edba1ef02"
+  COMPONENTS_REF: "f525d3635bad19346ede4e78bc447ad8be847c39"
+  LLVM_MINGW_VERSION: "20260602"
+  LLVM_MINGW_DIR: "llvm-mingw-20260602-ucrt-ubuntu-22.04-x86_64"
+  LLVM_MINGW_SHA256: "9d191203f9768ead60662d3ae53cdf28e0a28b1e6d44b7f329b9202cb2add337"
+
+jobs:
+  build:
+    name: FEXCore-F7 2609 ${{ matrix.flavor }}
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: performance
+            version_name: f7-2609-performance-v0.2
+            tuned: "1"
+          - flavor: stable
+            version_name: f7-2609-stable-v0.2
+            tuned: "0"
+
+    steps:
+      - name: Checkout pinned FEX-2609 source
+        uses: actions/checkout@v4
+        with:
+          repository: FEX-Emu/FEX
+          ref: ${{ env.FEX_REF }}
+          path: fex
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout pinned WinNative Components patches
+        uses: actions/checkout@v4
+        with:
+          repository: WinNative-Emu/Components
+          ref: ${{ env.COMPONENTS_REF }}
+          path: components
+          fetch-depth: 1
+
+      - name: Verify pinned source
+        run: |
+          set -euo pipefail
+          ACTUAL="$(git -C fex rev-parse HEAD)"
+          test "$ACTUAL" = "$FEX_REF"
+          echo "FEX source: $ACTUAL"
+          test -f components/patch/fex-appconfig-nonfatal.patch
+
+      - name: Apply WinNative app-config nonfatal fix
+        run: |
+          set -euo pipefail
+          cd fex
+          git apply --check ../components/patch/fex-appconfig-nonfatal.patch
+          git apply ../components/patch/fex-appconfig-nonfatal.patch
+          grep -q "invalid JSON format, ignoring it" Source/Common/Config.cpp
+          echo "app-config nonfatal fix applied"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils git cmake ninja-build \
+            python3 pkg-config file llvm ccache
+
+      - name: Cache LLVM-MinGW
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_MINGW_DIR }}
+          key: f7-fex-llvm-mingw-${{ env.LLVM_MINGW_VERSION }}
+
+      - name: Download LLVM-MinGW
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ARCHIVE="${LLVM_MINGW_DIR}.tar.xz"
+          curl -L --fail --retry 3 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${ARCHIVE}" \
+            -o "$ARCHIVE"
+          echo "${LLVM_MINGW_SHA256}  ${ARCHIVE}" | sha256sum -c -
+          tar -xJf "$ARCHIVE"
+          rm "$ARCHIVE"
+
+      - name: Add LLVM-MinGW to PATH
+        run: |
+          echo "$GITHUB_WORKSPACE/${LLVM_MINGW_DIR}/bin" >> "$GITHUB_PATH"
+
+      - name: Configure ccache
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ccache"
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPRESS=1" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: f7-fex-2609-${{ matrix.flavor }}-${{ env.FEX_REF }}-${{ github.run_id }}
+          restore-keys: |
+            f7-fex-2609-${{ matrix.flavor }}-${{ env.FEX_REF }}-
+            f7-fex-2609-${{ matrix.flavor }}-
+
+      - name: Build ARM64EC and WoW64 DLLs
+        run: |
+          set -euo pipefail
+
+          build_fex() {
+            triple="$1"
+            build="$2"
+
+            common_args=(
+              -G Ninja
+              -Wno-dev
+              -DCMAKE_BUILD_TYPE=Release
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+              -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/fex/Data/CMake/toolchain_mingw.cmake"
+              -DMINGW_TRIPLE="${triple}-w64-mingw32"
+              -DENABLE_FEXCORE_PROFILER=False
+              -DENABLE_OFFLINE_TELEMETRY=False
+              -DENABLE_LTO=False
+              -DENABLE_ASSERTIONS=False
+              -DBUILD_TESTING=False
+              -DENABLE_JEMALLOC_GLIBC_ALLOC=False
+              -DOVERRIDE_VERSION="FEX-2609-F7-v0.2-${{ matrix.flavor }}"
+              -DOVERRIDE_HASH="$FEX_REF"
+            )
+
+            if [ "${{ matrix.tuned }}" = "1" ]; then
+              common_args+=(
+                -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -fno-strict-aliasing -fwrapv"
+                -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -fno-strict-aliasing -fwrapv"
+                -DTUNE_ARCH=armv8.2-a
+                -DTUNE_CPU=cortex-a720
+              )
+            fi
+
+            rm -rf "$build"
+            CXXFLAGS="-Wno-deprecated-enum-enum-conversion" \
+              cmake -S fex -B "$build" "${common_args[@]}"
+            cmake --build "$build" -j 2
+          }
+
+          build_fex arm64ec build-fex-ec
+          build_fex aarch64 build-fex-wow
+
+      - name: Stage and strip binaries
+        run: |
+          set -euo pipefail
+          mkdir -p pkg/system32
+
+          EC="$(find build-fex-ec -type f -name libarm64ecfex.dll | head -n1)"
+          WOW="$(find build-fex-wow -type f -name libwow64fex.dll | head -n1)"
+
+          test -f "$EC"
+          test -f "$WOW"
+
+          cp "$EC"  pkg/system32/libarm64ecfex.dll
+          cp "$WOW" pkg/system32/libwow64fex.dll
+
+          llvm-strip --strip-all pkg/system32/libarm64ecfex.dll
+          llvm-strip --strip-all pkg/system32/libwow64fex.dll
+
+          file pkg/system32/*.dll
+          llvm-objdump -f pkg/system32/libarm64ecfex.dll | tee arm64ec.objdump.txt
+          llvm-objdump -f pkg/system32/libwow64fex.dll   | tee wow64.objdump.txt
+
+          grep -q "file format coff-arm64ec" arm64ec.objdump.txt
+          grep -q "file format coff-arm64" wow64.objdump.txt
+
+      - name: Validate compatibility patch in built DLLs
+        run: |
+          set -euo pipefail
+
+          # The patched error string must survive in at least one runtime DLL.
+          (
+            strings pkg/system32/libarm64ecfex.dll
+            strings pkg/system32/libwow64fex.dll
+          ) | grep -q "invalid JSON format, ignoring it"
+
+          if [ "${{ matrix.tuned }}" = "1" ]; then
+            (
+              strings pkg/system32/libarm64ecfex.dll
+              strings pkg/system32/libwow64fex.dll
+            ) | grep -q "Cortex-A720"
+          fi
+
+      - name: Create profile
+        run: |
+          set -euo pipefail
+
+          if [ "${{ matrix.flavor }}" = "performance" ]; then
+            DESC="POCO F7 FEXCore 2609 Performance v0.2: ARMv8.2-A/Cortex-A720 tuning, profiler/telemetry off, WinNative app-config nonfatal fix"
+          else
+            DESC="POCO F7 FEXCore 2609 Stable v0.2: upstream-like Release codegen, profiler/telemetry off, WinNative app-config nonfatal fix"
+          fi
+
+          cat > pkg/profile.json <<EOF
+          {
+            "type": "FEXCore",
+            "versionName": "${{ matrix.version_name }}",
+            "versionCode": 2,
+            "description": "${DESC}",
+            "files": [
+              { "source": "system32/libarm64ecfex.dll", "target": "\${system32}/libarm64ecfex.dll" },
+              { "source": "system32/libwow64fex.dll", "target": "\${system32}/libwow64fex.dll" }
+            ]
+          }
+          EOF
+
+          python3 -m json.tool pkg/profile.json >/dev/null
+
+      - name: Package and verify WCP
+        run: |
+          set -euo pipefail
+
+          NAME="FEXCore-F7-2609-${{ matrix.flavor }}-v0.2"
+
+          (
+            cd pkg
+            tar -cJf "$GITHUB_WORKSPACE/${NAME}.wcp" \
+              profile.json system32/libarm64ecfex.dll system32/libwow64fex.dll
+          )
+
+          tar -tJf "${NAME}.wcp" | tee "${NAME}.contents.txt"
+          grep -qx "profile.json" "${NAME}.contents.txt"
+          grep -qx "system32/libarm64ecfex.dll" "${NAME}.contents.txt"
+          grep -qx "system32/libwow64fex.dll" "${NAME}.contents.txt"
+
+          sha256sum "${NAME}.wcp" > "${NAME}.sha256"
+          sha256sum pkg/system32/libarm64ecfex.dll pkg/system32/libwow64fex.dll \
+            > "${NAME}-binaries.sha256"
+
+          cat > "${NAME}-BUILD.txt" <<EOF
+          FEXCore-F7 v0.2
+          flavor=${{ matrix.flavor }}
+          fex_commit=${FEX_REF}
+          fex_release=FEX-2609
+          components_patch_commit=${COMPONENTS_REF}
+          appconfig_nonfatal_fix=yes
+          profiler=off
+          offline_telemetry=off
+          lto=off
+          assertions=off
+          testing=off
+          tuned=${{ matrix.tuned }}
+          tune_arch=$([ "${{ matrix.tuned }}" = "1" ] && echo "armv8.2-a" || echo "upstream-default")
+          tune_cpu=$([ "${{ matrix.tuned }}" = "1" ] && echo "cortex-a720" || echo "upstream-default")
+          EOF
+
+          cat "${NAME}.sha256"
+          cat "${NAME}-binaries.sha256"
+          ls -lh "${NAME}.wcp"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FEXCore-F7-2609-${{ matrix.flavor }}-v0.2
+          path: |
+            FEXCore-F7-2609-${{ matrix.flavor }}-v0.2.wcp
+            FEXCore-F7-2609-${{ matrix.flavor }}-v0.2.sha256
+            FEXCore-F7-2609-${{ matrix.flavor }}-v0.2-binaries.sha256
+            FEXCore-F7-2609-${{ matrix.flavor }}-v0.2-BUILD.txt
+          retention-days: 30
+          if-no-files-found: error
