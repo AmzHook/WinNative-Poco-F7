@@ -1,0 +1,313 @@
+name: Build F7 Core Runtimes
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-core-f7.yml"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BOX64_REF: 51b5f8cfc2234c45238bbb90f6e23ff6f2ca0fd6
+  FEX_REF: FEX-2609
+  LLVM_MINGW_VERSION: "20260602"
+  NDK_VERSION: "r27c"
+  ANDROID_API: "28"
+
+jobs:
+  box64-f7:
+    name: Box64-F7 Android
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Box64
+        uses: actions/checkout@v4
+        with:
+          repository: ptitSeb/box64
+          ref: ${{ env.BOX64_REF }}
+          path: box64
+          fetch-depth: 1
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build unzip xz-utils zstd file
+
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: android-ndk-${{ env.NDK_VERSION }}
+          key: f7-ndk-${{ env.NDK_VERSION }}
+
+      - name: Download Android NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L --fail --retry 3 \
+            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip" \
+            -o ndk.zip
+          unzip -q ndk.zip
+          rm ndk.zip
+
+      - name: Patch Android release flags for POCO F7
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("box64/CMakeLists.txt")
+          s = p.read_text()
+          old = '''if(TERMUX OR ANDROID)
+              set(CMAKE_C_FLAGS_RELEASE "-O1")
+              set(CMAKE_CXX_FLAGS_RELEASE "-O1")
+              set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O1 -g")
+              set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O1 -g")
+          endif()'''
+          new = '''if(TERMUX OR ANDROID)
+              set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG -march=armv8.2-a -mtune=cortex-a720 -fno-strict-aliasing -fwrapv")
+              set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -march=armv8.2-a -mtune=cortex-a720 -fno-strict-aliasing -fwrapv")
+              set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -march=armv8.2-a -mtune=cortex-a720 -fno-strict-aliasing -fwrapv")
+              set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -march=armv8.2-a -mtune=cortex-a720 -fno-strict-aliasing -fwrapv")
+          endif()'''
+          if old not in s:
+              raise SystemExit("Expected Android flags block not found; upstream source changed.")
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Configure and build Box64-F7
+        run: |
+          NDK="$GITHUB_WORKSPACE/android-ndk-${NDK_VERSION}"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang"
+          cmake -S box64 -B build-box64 -G Ninja \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID=1 \
+            -DARM_DYNAREC=1 \
+            -DBAD_SIGNAL=1
+          cmake --build build-box64 -j "$(nproc)"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" build-box64/box64
+          file build-box64/box64
+
+      - name: Package Box64 WCP
+        run: |
+          mkdir -p pkg-box64
+          cp build-box64/box64 pkg-box64/box64
+          cat > pkg-box64/profile.json <<'EOF'
+          {
+            "type": "Box64",
+            "versionName": "F7-0.4.5-51b5f8cfc-a720-v0.1",
+            "versionCode": 1,
+            "description": "POCO F7 Box64 build: Android API 28, ARM dynarec, Cortex-A720 tuning",
+            "files": [
+              { "source": "box64", "target": "${bindir}/box64" }
+            ]
+          }
+          EOF
+          tar -C pkg-box64 -cJf Box64-F7-0.4.5-51b5f8cfc.wcp box64 profile.json
+          sha256sum Box64-F7-0.4.5-51b5f8cfc.wcp > Box64-F7-0.4.5-51b5f8cfc.sha256
+
+      - name: Upload Box64-F7
+        uses: actions/upload-artifact@v4
+        with:
+          name: Box64-F7
+          path: |
+            Box64-F7-0.4.5-51b5f8cfc.wcp
+            Box64-F7-0.4.5-51b5f8cfc.sha256
+          if-no-files-found: error
+
+  wowbox64-f7:
+    name: WOWBox64-F7
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Box64
+        uses: actions/checkout@v4
+        with:
+          repository: ptitSeb/box64
+          ref: ${{ env.BOX64_REF }}
+          path: box64
+          fetch-depth: 1
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build xz-utils file
+
+      - name: Cache LLVM-MinGW
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-ucrt-ubuntu-22.04-x86_64
+          key: f7-llvm-mingw-${{ env.LLVM_MINGW_VERSION }}
+
+      - name: Download LLVM-MinGW
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          ARCHIVE="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          curl -L --fail --retry 3 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${ARCHIVE}" \
+            -o "${ARCHIVE}"
+          echo "9d191203f9768ead60662d3ae53cdf28e0a28b1e6d44b7f329b9202cb2add337  ${ARCHIVE}" | sha256sum -c -
+          tar -xJf "${ARCHIVE}"
+          rm "${ARCHIVE}"
+
+      - name: Add LLVM-MinGW to PATH
+        run: |
+          echo "$GITHUB_WORKSPACE/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Apply WinNative WOW CRT shims
+        run: |
+          cat >> box64/wine/common/crt.c <<'EOF'
+
+          int __mingw_vsprintf(char* buffer, const char* format, va_list args) { return vsprintf(buffer, format, args); }
+          int strcasecmp(const char *s1, const char *s2);
+          int (*__imp__stricmp)(const char *, const char *) = strcasecmp;
+          EOF
+
+      - name: Configure and build WOWBox64-F7
+        run: |
+          cmake -S box64 -B build-wow -G Ninja \
+            -DCMAKE_C_COMPILER=aarch64-w64-mingw32-clang \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG -march=armv8.2-a -mtune=cortex-a720 -fno-strict-aliasing -fwrapv" \
+            -DWOW64=1 \
+            -DARM_DYNAREC=1
+          cmake --build build-wow --target wowbox64 -j "$(nproc)"
+          DLL="$(find build-wow -type f -name wowbox64.dll | head -n1)"
+          test -f "$DLL"
+          llvm-strip --strip-all "$DLL"
+          mkdir -p pkg-wow
+          cp "$DLL" pkg-wow/wowbox64.dll
+          file pkg-wow/wowbox64.dll
+
+      - name: Package WOWBox64 WCP
+        run: |
+          cat > pkg-wow/profile.json <<'EOF'
+          {
+            "type": "WOWBox64",
+            "versionName": "F7-0.4.5-51b5f8cfc-a720-v0.1",
+            "versionCode": 1,
+            "description": "POCO F7 WOWBox64 build: ARM64 Windows DLL, Cortex-A720 tuning",
+            "files": [
+              { "source": "wowbox64.dll", "target": "${system32}/wowbox64.dll" }
+            ]
+          }
+          EOF
+          tar -C pkg-wow -cJf WOWBox64-F7-0.4.5-51b5f8cfc.wcp wowbox64.dll profile.json
+          sha256sum WOWBox64-F7-0.4.5-51b5f8cfc.wcp > WOWBox64-F7-0.4.5-51b5f8cfc.sha256
+
+      - name: Upload WOWBox64-F7
+        uses: actions/upload-artifact@v4
+        with:
+          name: WOWBox64-F7
+          path: |
+            WOWBox64-F7-0.4.5-51b5f8cfc.wcp
+            WOWBox64-F7-0.4.5-51b5f8cfc.sha256
+          if-no-files-found: error
+
+  fexcore-f7:
+    name: FEXCore-F7 2609
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout FEX 2609
+        uses: actions/checkout@v4
+        with:
+          repository: FEX-Emu/FEX
+          ref: ${{ env.FEX_REF }}
+          submodules: recursive
+          fetch-depth: 1
+          path: fex
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build python3 pkg-config xz-utils file ccache
+
+      - name: Cache LLVM-MinGW
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-ucrt-ubuntu-22.04-x86_64
+          key: f7-llvm-mingw-${{ env.LLVM_MINGW_VERSION }}
+
+      - name: Download LLVM-MinGW
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          ARCHIVE="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          curl -L --fail --retry 3 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${ARCHIVE}" \
+            -o "${ARCHIVE}"
+          echo "9d191203f9768ead60662d3ae53cdf28e0a28b1e6d44b7f329b9202cb2add337  ${ARCHIVE}" | sha256sum -c -
+          tar -xJf "${ARCHIVE}"
+          rm "${ARCHIVE}"
+
+      - name: Add LLVM-MinGW to PATH
+        run: |
+          echo "$GITHUB_WORKSPACE/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Build FEX ARM64EC + WoW64 DLLs
+        run: |
+          set -euo pipefail
+          build_fex() {
+            triple="$1"
+            build="$2"
+            rm -rf "$build"
+            CXXFLAGS="-Wno-deprecated-enum-enum-conversion" \
+            cmake -S fex -B "$build" -G Ninja -Wno-dev \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/fex/Data/CMake/toolchain_mingw.cmake" \
+              -DMINGW_TRIPLE="${triple}-w64-mingw32" \
+              -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -fno-strict-aliasing -fwrapv" \
+              -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -fno-strict-aliasing -fwrapv" \
+              -DENABLE_FEXCORE_PROFILER=False \
+              -DENABLE_OFFLINE_TELEMETRY=False \
+              -DENABLE_LTO=False \
+              -DENABLE_ASSERTIONS=False \
+              -DBUILD_TESTING=False \
+              -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+              -DTUNE_ARCH=armv8.2-a \
+              -DTUNE_CPU=cortex-a720 \
+              -DOVERRIDE_VERSION=FEX-2609-F7 \
+              -DOVERRIDE_HASH=395b132f346b1a45def246d10c52245edba1ef02
+            cmake --build "$build" -j 2
+          }
+
+          build_fex arm64ec build-fex-ec
+          build_fex aarch64 build-fex-wow
+
+          mkdir -p pkg-fex/system32
+          EC="$(find build-fex-ec -type f -name libarm64ecfex.dll | head -n1)"
+          WOW="$(find build-fex-wow -type f -name libwow64fex.dll | head -n1)"
+          test -f "$EC"
+          test -f "$WOW"
+          cp "$EC" pkg-fex/system32/libarm64ecfex.dll
+          cp "$WOW" pkg-fex/system32/libwow64fex.dll
+          llvm-strip --strip-all pkg-fex/system32/*.dll
+          file pkg-fex/system32/*.dll
+
+      - name: Package FEXCore-F7 WCP
+        run: |
+          cat > pkg-fex/profile.json <<'EOF'
+          {
+            "type": "FEXCore",
+            "versionName": "F7-2609-arm64ec-a720-v0.1",
+            "versionCode": 1,
+            "description": "POCO F7 FEXCore 2609: profiler off, telemetry off, ARMv8.2-A + Cortex-A720 tuning",
+            "files": [
+              { "source": "system32/libarm64ecfex.dll", "target": "${system32}/libarm64ecfex.dll" },
+              { "source": "system32/libwow64fex.dll", "target": "${system32}/libwow64fex.dll" }
+            ]
+          }
+          EOF
+          tar -C pkg-fex -cJf FEXCore-F7-2609-arm64ec.wcp .
+          sha256sum FEXCore-F7-2609-arm64ec.wcp > FEXCore-F7-2609-arm64ec.sha256
+
+      - name: Upload FEXCore-F7
+        uses: actions/upload-artifact@v4
+        with:
+          name: FEXCore-F7
+          path: |
+            FEXCore-F7-2609-arm64ec.wcp
+            FEXCore-F7-2609-arm64ec.sha256
+          if-no-files-found: error
