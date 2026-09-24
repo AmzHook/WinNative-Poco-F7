@@ -1,0 +1,409 @@
+name: Build Wine-F7 11.0-2
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-wine-f7.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PROTON_WINE_REF: "5d0d333e7beef02fbb455cc3163b4e8e25615458"
+  NTSYNC_REF: "7ce6435e5979b1cb5341aa4b299f31e8937fe121"
+  LLVM_MINGW_DIR: "llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64"
+  PREFIX_PIN: "6286ac456e4a8376e053ce1ce4f565bd37cc4af4"
+  # User-supplied/public reference WCPs audited before this workflow was made.
+  # They remain controls/fallbacks; these exact binaries are NOT silently relabeled as F7 builds.
+  REF_WINE_113_SHA256: "1da5e7cfc6ca6c1ed6e892ef1a9bbaa3c1da2319a2e1486b2830f44f0cf5a42d"
+  REF_WINE_100_REF4IK_SHA256: "cc0bb414bea05b576a353dd2d76dc07832de57e6a9626bf1f33e061f61d166df"
+
+jobs:
+  build:
+    name: Wine-F7 ${{ matrix.arch_name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            arch_name: arm64ec
+            output_dir: compiled-files-aarch64
+            prefix_name: prefixPack-arm64ec-11.txz
+            prefix_sha: ade99dc80b17086a269c038c9bc50167902103a9a61df763cba4d613543ff12a
+          - arch: x86_64
+            arch_name: x86_64
+            output_dir: compiled-files-x86_64
+            prefix_name: prefixPack-x86_64-11.txz
+            prefix_sha: d8d1d8af905af40ae7f37114de1cf87575f88827fd8e2780cd2f92d7852a8ed0
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Checkout reproducible GameNative proton-wine 11.0-2 source
+        uses: actions/checkout@v4
+        with:
+          repository: GameNative/proton-wine
+          ref: ${{ env.PROTON_WINE_REF }}
+          path: source
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Record pinned source
+        run: |
+          cd source
+          test "$(git rev-parse HEAD)" = "${PROTON_WINE_REF}"
+          git log -1 --oneline
+
+      - name: Install build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip flex bison gettext autoconf automake \
+            libtool pkg-config ccache zstd xz-utils file binutils \
+            mingw-w64 gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 \
+            zlib1g-dev zlib1g-dev:i386
+
+      - name: Download Termux bionic sysroot
+        run: |
+          mkdir -p "$HOME/termuxfs/${{ matrix.arch }}"
+          cd "$HOME/termuxfs/${{ matrix.arch }}"
+          wget -q --tries=5 --retry-connrefused \
+            "https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-${{ matrix.arch }}.tar"
+          tar -xf "termuxfs-${{ matrix.arch }}.tar"
+          rm "termuxfs-${{ matrix.arch }}.tar"
+
+      - name: Cache Android NDK r27d
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/Android/Sdk/ndk/27.3.13750724
+          key: f7-proton-ndk-r27d
+
+      - name: Setup Android NDK r27d
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --tries=5 --retry-connrefused \
+            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+          rm android-ndk-r27d-linux.zip
+
+      - name: Cache LLVM-MinGW
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/${{ env.LLVM_MINGW_DIR }}
+          key: f7-proton-bylaws-llvm-mingw-20250920
+
+      - name: Setup LLVM-MinGW
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --tries=5 --retry-connrefused \
+            https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xJf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          rm llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Checkout pinned ntsync-android
+        uses: actions/checkout@v4
+        with:
+          repository: GameNative/ntsync-android
+          ref: ${{ env.NTSYNC_REF }}
+          path: ntsync-android
+          fetch-depth: 1
+
+      - name: Setup Rust for ntsync-android
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+
+      - name: Apply POCO F7 compile policy
+        run: |
+          set -euo pipefail
+
+          # ARM64EC path: tune the Android/aarch64 unix side for the common A720 cores
+          # while retaining ARMv8.2-A as the ISA floor shared with the X4/A720 cluster.
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("source/build-scripts/build-step-arm64ec.sh")
+          s = p.read_text()
+          old = 'export C_OPTS="-g0 -O2 -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES -Wno-declaration-after-statement -Wno-implicit-function-declaration -Wno-int-conversion"'
+          new = 'export C_OPTS="-g0 -O2 -DNDEBUG -march=armv8.2-a -mtune=cortex-a720 -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES -Wno-declaration-after-statement -Wno-implicit-function-declaration -Wno-int-conversion"'
+          if old not in s:
+              raise SystemExit("ARM64 C_OPTS marker not found; source changed")
+          s = s.replace(old, new, 1)
+
+          old_tc = 'export LLVM_MINGW_TOOLCHAIN="$HOME/toolchains/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64/bin"'
+          new_tc = 'export LLVM_MINGW_TOOLCHAIN="$HOME/toolchains/f7-llvm-mingw/bin"'
+          if old_tc not in s:
+              raise SystemExit("LLVM_MINGW_TOOLCHAIN marker not found; source changed")
+          p.write_text(s.replace(old_tc, new_tc, 1))
+          PY
+
+            REAL="$HOME/toolchains/${LLVM_MINGW_DIR}/bin"
+            WRAP="$HOME/toolchains/f7-llvm-mingw/bin"
+            mkdir -p "$WRAP"
+
+            # Mirror the tested toolchain. Override only ARM64/ARM64EC C/C++ front-ends,
+            # so the i386 WoW64 compiler remains generic and never receives ARM flags.
+            for f in "$REAL"/*; do
+              ln -sf "$f" "$WRAP/$(basename "$f")"
+            done
+
+            for triple in arm64ec-w64-mingw32 aarch64-w64-mingw32; do
+              for lang in clang clang++; do
+                rm -f "$WRAP/${triple}-${lang}"
+                cat > "$WRAP/${triple}-${lang}" <<EOF
+          #!/bin/sh
+          exec "$REAL/${triple}-${lang}" -march=armv8.2-a -mtune=cortex-a720 "\$@"
+          EOF
+                chmod +x "$WRAP/${triple}-${lang}"
+              done
+            done
+
+            # Hard probe: do not silently publish a generic build if the ARM64EC
+            # compiler cannot accept our POCO F7 tuning flags.
+            printf 'int f7_probe(void){return 7;}\n' >/tmp/f7-probe.c
+            "$WRAP/arm64ec-w64-mingw32-clang" -c /tmp/f7-probe.c -o /tmp/f7-arm64ec.o
+            "$WRAP/aarch64-w64-mingw32-clang" -c /tmp/f7-probe.c -o /tmp/f7-aarch64.o
+            file /tmp/f7-arm64ec.o /tmp/f7-aarch64.o
+          fi
+
+          # x86_64 Wine stays generic. Box64-F7 is responsible for AArch64 JIT tuning.
+          grep -n 'C_OPTS=' "source/build-scripts/build-step-${{ matrix.arch == 'aarch64' && 'arm64ec' || 'x86_64' }}.sh" || true
+
+      - name: Run autogen
+        working-directory: source
+        run: bash autogen.sh
+
+      - name: Cache wine-tools
+        id: cache-wine-tools
+        uses: actions/cache@v4
+        with:
+          path: source/wine-tools
+          key: f7-proton-wine-tools-${{ env.PROTON_WINE_REF }}
+
+      - name: Build wine-tools
+        if: steps.cache-wine-tools.outputs.cache-hit != 'true'
+        working-directory: source
+        run: bash build-scripts/build-step0.sh
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: f7-proton-ccache-${{ matrix.arch }}-${{ env.PROTON_WINE_REF }}-${{ github.run_id }}
+          restore-keys: |
+            f7-proton-ccache-${{ matrix.arch }}-${{ env.PROTON_WINE_REF }}-
+            f7-proton-ccache-${{ matrix.arch }}-
+
+      - name: Build android_sysvshm
+        if: matrix.arch == 'aarch64'
+        working-directory: source
+        run: bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+
+      - name: Build pinned ntsync-android
+        working-directory: source
+        env:
+          NTSYNC_ANDROID_DIR: ${{ github.workspace }}/ntsync-android
+        run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            bash build-scripts/build-step-x86_64.sh --build-ntsync-android
+          else
+            bash build-scripts/build-step-arm64ec.sh --build-ntsync-android
+          fi
+
+      - name: Configure Wine-F7
+        working-directory: source
+        run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            bash build-scripts/build-step-x86_64.sh --configure
+          else
+            bash build-scripts/build-step-arm64ec.sh --configure
+          fi
+
+      - name: Build Wine-F7
+        working-directory: source
+        run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            bash build-scripts/build-step-x86_64.sh --build
+          else
+            bash build-scripts/build-step-arm64ec.sh --build
+          fi
+
+      - name: Install Wine-F7
+        working-directory: source
+        run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            bash build-scripts/build-step-x86_64.sh --install
+          else
+            bash build-scripts/build-step-arm64ec.sh --install
+          fi
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
+
+      - name: Validate installed runtime
+        run: |
+          set -euo pipefail
+          OUT="$HOME/${{ matrix.output_dir }}"
+          test -x "$OUT/bin/wine"
+          test -f "$OUT/share/wine/wine.inf"
+
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            test -f "$OUT/lib/wine/aarch64-unix/ntdll.so"
+            test -f "$OUT/lib/wine/aarch64-windows/ntdll.dll"
+            test -f "$OUT/lib/wine/i386-windows/ntdll.dll"
+
+            file "$OUT/lib/wine/aarch64-unix/ntdll.so"
+            file "$OUT/lib/wine/aarch64-windows/ntdll.dll"
+            file "$OUT/lib/wine/i386-windows/ntdll.dll"
+
+            # ARM64 unix code must retain Android API 28 and 16K-capable load alignment.
+            readelf -n "$OUT/lib/wine/aarch64-unix/ntdll.so" | grep -q 'Android'
+            readelf -W -l "$OUT/lib/wine/aarch64-unix/ntdll.so" > /tmp/phdr.txt
+            python3 - <<'PY'
+          import re
+          s=open('/tmp/phdr.txt').read()
+          aligns=[]
+          for line in s.splitlines():
+              if line.strip().startswith('LOAD'):
+                  m=re.search(r'0x([0-9a-fA-F]+)\s*$', line)
+                  if m: aligns.append(int(m.group(1),16))
+          if not aligns or min(aligns) < 0x4000:
+              raise SystemExit(f"PT_LOAD alignment is not 16K-capable: {aligns}")
+          print("ARM64 PT_LOAD alignments:", [hex(x) for x in aligns])
+          PY
+          else
+            test -f "$OUT/lib/wine/x86_64-unix/ntdll.so"
+            test -f "$OUT/lib/wine/x86_64-windows/ntdll.dll"
+            test -f "$OUT/lib/wine/i386-windows/ntdll.dll"
+            file "$OUT/lib/wine/x86_64-unix/ntdll.so"
+            file "$OUT/lib/wine/x86_64-windows/ntdll.dll"
+            file "$OUT/lib/wine/i386-windows/ntdll.dll"
+          fi
+
+          # Features expected from the reproducible GameNative proton-wine 11.0-2 bionic source base.
+          BLOB="$(find "$OUT/lib/wine" -type f \( -name 'ntdll.so' -o -name 'wineserver*' \) -print)"
+          strings $BLOB 2>/dev/null | grep -q 'WINE_FAST_YIELD'
+          strings $BLOB 2>/dev/null | grep -q 'WINEVMEMMAXSIZE'
+          strings $BLOB 2>/dev/null | grep -Eq 'ntsync|NTSYNC'
+
+      - name: Download pinned prefixPack
+        run: |
+          URL="https://raw.githubusercontent.com/GameNative/bionic-prefix-files/${PREFIX_PIN}/${{ matrix.prefix_name }}"
+          wget -q --tries=5 --retry-connrefused "$URL" -O prefixPack.txz
+          echo "${{ matrix.prefix_sha }}  prefixPack.txz" | sha256sum -c -
+
+      - name: Generate Wine-F7 profile
+        run: |
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            EXTRA="ARMv8.2-A + Cortex-A720 tuned ARM64 unix/ARM64EC code"
+          else
+            EXTRA="generic x86_64 code for Box64-F7 translation"
+          fi
+
+          cat > profile.json <<EOF
+          {
+            "type": "Wine",
+            "versionName": "11.0-2-f7-${{ matrix.arch_name }}-v0.1",
+            "versionCode": 1,
+            "description": "Wine-F7 11.0-2 ${{ matrix.arch_name }} bionic for POCO F7, packaged as Wine. Reproducible GameNative proton-wine base ${PROTON_WINE_REF}; runtime ntsync kernel/userspace fallback, fsync/Android fixes, API 28 + 16KB pages; ${EXTRA}.",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib",
+              "prefixPack": "prefixPack.txz"
+            }
+          }
+          EOF
+          python3 -m json.tool profile.json >/dev/null
+
+      - name: Package Wine-F7 WCP
+        run: |
+          set -euo pipefail
+          OUT="$HOME/${{ matrix.output_dir }}"
+          cp prefixPack.txz "$OUT/"
+          cp profile.json "$OUT/"
+          cd "$OUT"
+          # Wine components in the current WinNative catalog are commonly XZ WCPs.
+          # Keep the conventional .wcp extension while using tar.xz internally.
+          tar -cJf \
+            "$GITHUB_WORKSPACE/Wine-F7-11.0-2-${{ matrix.arch_name }}.wcp" \
+            bin lib share prefixPack.txz profile.json
+
+      - name: Verify packaged WCP
+        run: |
+          set -euo pipefail
+          WCP="Wine-F7-11.0-2-${{ matrix.arch_name }}.wcp"
+          tar -tJf "$WCP" > wcp.lst
+          grep -qx 'profile.json' wcp.lst
+          grep -qx 'prefixPack.txz' wcp.lst
+          grep -qx 'bin/wine' wcp.lst
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            grep -qx 'lib/wine/aarch64-unix/ntdll.so' wcp.lst
+            grep -qx 'lib/wine/aarch64-windows/ntdll.dll' wcp.lst
+            grep -qx 'lib/wine/i386-windows/ntdll.dll' wcp.lst
+          else
+            grep -qx 'lib/wine/x86_64-unix/ntdll.so' wcp.lst
+            grep -qx 'lib/wine/x86_64-windows/ntdll.dll' wcp.lst
+            grep -qx 'lib/wine/i386-windows/ntdll.dll' wcp.lst
+          fi
+          tar -xJf "$WCP" -O profile.json > packed-profile.json
+          cmp packed-profile.json profile.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open("packed-profile.json"))
+          assert p["type"] == "Wine", p
+          v=p["versionName"]
+          assert v == v.lower(), v
+          if "${{ matrix.arch_name }}" == "arm64ec":
+              assert "arm64ec" in v, v
+          print("profile OK:", p["type"], v)
+          PY
+
+          sha256sum "$WCP" > "Wine-F7-11.0-2-${{ matrix.arch_name }}.sha256"
+
+          cat > "Wine-F7-11.0-2-${{ matrix.arch_name }}-BUILD.txt" <<EOF
+          Wine-F7 11.0-2 ${{ matrix.arch_name }} v0.1
+          package_type=Wine
+          source_family=GameNative/proton-wine (Wine/Proton fork; not byte-identical to stock Wine 11.3 or Ref4ik 10.0)
+          proton-wine=${PROTON_WINE_REF}
+          ntsync-android=${NTSYNC_REF}
+          reference_wine_11.3_arm64ec_sha256=${REF_WINE_113_SHA256}
+          reference_wine_10.0_ref4ik_x86_64_sha256=${REF_WINE_100_REF4IK_SHA256}
+          android_api=28
+          flexible_pages=16KB
+          optimization=-O2
+          arm64_isa=$([ "${{ matrix.arch }}" = "aarch64" ] && echo "armv8.2-a" || echo "n/a")
+          arm64_tune=$([ "${{ matrix.arch }}" = "aarch64" ] && echo "cortex-a720" || echo "handled by Box64-F7")
+          EOF
+
+          cat "Wine-F7-11.0-2-${{ matrix.arch_name }}.sha256"
+          ls -lh "$WCP"
+
+      - name: Upload Wine-F7 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wine-F7-${{ matrix.arch_name }}
+          path: |
+            Wine-F7-11.0-2-${{ matrix.arch_name }}.wcp
+            Wine-F7-11.0-2-${{ matrix.arch_name }}.sha256
+            Wine-F7-11.0-2-${{ matrix.arch_name }}-BUILD.txt
+          retention-days: 30
+          if-no-files-found: error
