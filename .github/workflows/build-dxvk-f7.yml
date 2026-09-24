@@ -1,0 +1,365 @@
+name: Build DXVK-F7
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-dxvk-f7.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DXVK_STABLE_REF: "v3.1.1"
+  DXVK_GPL_REF: "25ca63f17f34bdc05a39873ee63907d3cbbfa030"
+  COMPONENTS_REF: "f525d3635bad19346ede4e78bc447ad8be847c39"
+  LLVM_MINGW_VERSION: "20251104"
+  LLVM_MINGW_DIR: "llvm-mingw-20251104-ucrt-ubuntu-22.04-x86_64"
+
+jobs:
+  build:
+    name: DXVK-F7 ${{ matrix.flavor }} ${{ matrix.arch_name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: stable
+            source_ref: v3.1.1
+            arch_name: x86_64
+            machine64: coff-x86-64
+          - flavor: stable
+            source_ref: v3.1.1
+            arch_name: arm64ec
+            machine64: coff-arm64ec
+          - flavor: gplasync
+            source_ref: 25ca63f17f34bdc05a39873ee63907d3cbbfa030
+            arch_name: x86_64
+            machine64: coff-x86-64
+          - flavor: gplasync
+            source_ref: 25ca63f17f34bdc05a39873ee63907d3cbbfa030
+            arch_name: arm64ec
+            machine64: coff-arm64ec
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Checkout pinned DXVK
+        uses: actions/checkout@v4
+        with:
+          repository: doitsujin/dxvk
+          ref: ${{ matrix.source_ref }}
+          path: dxvk
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout pinned WinNative Components patch source
+        if: matrix.flavor == 'gplasync'
+        uses: actions/checkout@v4
+        with:
+          repository: WinNative-Emu/Components
+          ref: ${{ env.COMPONENTS_REF }}
+          path: components
+          fetch-depth: 1
+
+      - name: Verify source revision
+        run: |
+          set -euo pipefail
+          cd dxvk
+          ACTUAL="$(git rev-parse HEAD)"
+          if [ "${{ matrix.flavor }}" = "stable" ]; then
+            EXPECTED="$(git rev-list -n1 "${DXVK_STABLE_REF}")"
+          else
+            EXPECTED="${DXVK_GPL_REF}"
+          fi
+          test "$ACTUAL" = "$EXPECTED"
+          echo "DXVK source: $ACTUAL"
+          git describe --tags --always
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates curl xz-utils jq git build-essential \
+            python3 pkg-config meson ninja-build wget unzip \
+            patch file binutils
+
+      - name: Cache glslang
+        id: cache-glslang
+        uses: actions/cache@v4
+        with:
+          path: glslang
+          key: f7-glslang-master-tot
+
+      - name: Setup glslang
+        if: steps.cache-glslang.outputs.cache-hit != 'true'
+        run: |
+          wget -q --tries=5 --retry-connrefused \
+            https://github.com/KhronosGroup/glslang/releases/download/master-tot/glslang-master-linux-Release.zip
+          unzip -q glslang-master-linux-Release.zip -d glslang
+          rm glslang-master-linux-Release.zip
+
+      - name: Cache llvm-mingw
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_MINGW_DIR }}
+          key: f7-dxvk-llvm-mingw-${{ env.LLVM_MINGW_VERSION }}
+
+      - name: Setup llvm-mingw
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          wget -q --tries=5 --retry-connrefused \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${LLVM_MINGW_DIR}.tar.xz" \
+            -O llvm-mingw.tar.xz
+          tar -xJf llvm-mingw.tar.xz
+          rm llvm-mingw.tar.xz
+
+      - name: Set toolchain PATH
+        run: |
+          echo "$GITHUB_WORKSPACE/glslang/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/${LLVM_MINGW_DIR}/bin" >> "$GITHUB_PATH"
+
+      - name: Apply pinned GPLAsync patch
+        if: matrix.flavor == 'gplasync'
+        run: |
+          set -euo pipefail
+          cd dxvk
+          cp "$GITHUB_WORKSPACE/components/patch/dxvk-gplasync.patch" gplasync.patch
+          patch -p1 -f --dry-run < gplasync.patch
+          patch -p1 -f < gplasync.patch
+          grep -R -q 'DXVK_ASYNC' src
+
+      - name: Create cross files
+        run: |
+          set -euo pipefail
+
+          if [ "${{ matrix.arch_name }}" = "arm64ec" ]; then
+            C64="arm64ec-w64-mingw32-clang"
+            CXX64="arm64ec-w64-mingw32-clang++"
+            WINDRES64="arm64ec-w64-mingw32-windres"
+            WIDL64="arm64ec-w64-mingw32-widl"
+            CPU_FAMILY64="aarch64"
+            CPU64="aarch64"
+
+            # Refuse to publish a supposedly F7-tuned build if the compiler
+            # cannot actually accept the A720 tuning flags.
+            printf 'int main(void){return 0;}\n' >/tmp/f7-arm-probe.c
+            "$C64" -march=armv8.2-a -mtune=cortex-a720 -c /tmp/f7-arm-probe.c -o /tmp/f7-arm-probe.o
+            llvm-objdump -f /tmp/f7-arm-probe.o
+
+            cat > cross64.txt <<EOF
+          [binaries]
+          c = '${C64}'
+          cpp = '${CXX64}'
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          windres = '${WINDRES64}'
+          widl = '${WIDL64}'
+          pkg-config = 'pkg-config'
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = '${CPU_FAMILY64}'
+          cpu = '${CPU64}'
+          endian = 'little'
+
+          [built-in options]
+          c_args = ['-march=armv8.2-a', '-mtune=cortex-a720', '-DNDEBUG']
+          cpp_args = ['-march=armv8.2-a', '-mtune=cortex-a720', '-DNDEBUG']
+          EOF
+          else
+            cat > cross64.txt <<'EOF'
+          [binaries]
+          c = 'x86_64-w64-mingw32-clang'
+          cpp = 'x86_64-w64-mingw32-clang++'
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          windres = 'x86_64-w64-mingw32-windres'
+          widl = 'x86_64-w64-mingw32-widl'
+          pkg-config = 'pkg-config'
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+          fi
+
+          cat > cross32.txt <<'EOF'
+          [binaries]
+          c = 'i686-w64-mingw32-clang'
+          cpp = 'i686-w64-mingw32-clang++'
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          windres = 'i686-w64-mingw32-windres'
+          widl = 'i686-w64-mingw32-widl'
+          pkg-config = 'pkg-config'
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = 'x86'
+          cpu = 'i686'
+          endian = 'little'
+          EOF
+
+          echo "=== cross64.txt ==="
+          cat cross64.txt
+          echo "=== cross32.txt ==="
+          cat cross32.txt
+
+      - name: Build DXVK 64-bit / ARM64EC
+        run: |
+          set -euo pipefail
+          cd dxvk
+          meson setup build64 \
+            --cross-file "$GITHUB_WORKSPACE/cross64.txt" \
+            -Dbuildtype=release -Dstrip=true
+          ninja -C build64 -j 2
+
+      - name: Build DXVK 32-bit
+        run: |
+          set -euo pipefail
+          cd dxvk
+          meson setup build32 \
+            --cross-file "$GITHUB_WORKSPACE/cross32.txt" \
+            -Dbuildtype=release -Dstrip=true
+          ninja -C build32 -j 2
+
+      - name: Stage WCP
+        run: |
+          set -euo pipefail
+          mkdir -p packaging/system32 packaging/syswow64
+
+          copy_dlls() {
+            local build="$1"
+            local out="$2"
+            cp "dxvk/${build}/src/d3d9/d3d9.dll" "$out/"
+            cp "dxvk/${build}/src/d3d10/d3d10core.dll" "$out/"
+            cp "dxvk/${build}/src/d3d11/d3d11.dll" "$out/"
+            cp "dxvk/${build}/src/dxgi/dxgi.dll" "$out/"
+            cp "dxvk/${build}/src/d3d8/d3d8.dll" "$out/"
+          }
+
+          copy_dlls build64 packaging/system32
+          copy_dlls build32 packaging/syswow64
+
+          llvm-strip --strip-all packaging/system32/*.dll || true
+          llvm-strip --strip-all packaging/syswow64/*.dll || true
+
+          if [ "${{ matrix.flavor }}" = "stable" ]; then
+            VERSION_NAME="3.1.1-F7-${{ matrix.arch_name }}-stable"
+            DESC="DXVK-F7 3.1.1 stable for POCO F7"
+          else
+            VERSION_NAME="3.1.1-25ca63f1-F7-${{ matrix.arch_name }}-gplasync"
+            DESC="DXVK-F7 3.1.1+27 (25ca63f1) GPLAsync for POCO F7"
+          fi
+
+          if [ "${{ matrix.arch_name }}" = "arm64ec" ]; then
+            DESC="${DESC}; system32 ARM64EC tuned ARMv8.2-A/Cortex-A720, syswow64 i686"
+          else
+            DESC="${DESC}; system32 x86_64 generic, syswow64 i686; ARM tuning handled by Box64-F7"
+          fi
+
+          cat > packaging/profile.json <<EOF
+          {
+            "type": "DXVK",
+            "versionName": "${VERSION_NAME}",
+            "versionCode": 1,
+            "description": "${DESC}",
+            "files": [
+              { "source": "system32/d3d8.dll",      "target": "\${system32}/d3d8.dll" },
+              { "source": "system32/d3d9.dll",      "target": "\${system32}/d3d9.dll" },
+              { "source": "system32/d3d10core.dll", "target": "\${system32}/d3d10core.dll" },
+              { "source": "system32/d3d11.dll",     "target": "\${system32}/d3d11.dll" },
+              { "source": "system32/dxgi.dll",      "target": "\${system32}/dxgi.dll" },
+              { "source": "syswow64/d3d8.dll",      "target": "\${syswow64}/d3d8.dll" },
+              { "source": "syswow64/d3d9.dll",      "target": "\${syswow64}/d3d9.dll" },
+              { "source": "syswow64/d3d10core.dll", "target": "\${syswow64}/d3d10core.dll" },
+              { "source": "syswow64/d3d11.dll",     "target": "\${syswow64}/d3d11.dll" },
+              { "source": "syswow64/dxgi.dll",      "target": "\${syswow64}/dxgi.dll" }
+            ]
+          }
+          EOF
+
+          python3 -m json.tool packaging/profile.json >/dev/null
+
+      - name: Validate binary architecture and flavor
+        run: |
+          set -euo pipefail
+
+          for dll in d3d8 d3d9 d3d10core d3d11 dxgi; do
+            F64="packaging/system32/${dll}.dll"
+            F32="packaging/syswow64/${dll}.dll"
+
+            llvm-objdump -f "$F64" | tee /tmp/obj64
+            llvm-objdump -f "$F32" | tee /tmp/obj32
+
+            grep -q "file format ${{ matrix.machine64 }}" /tmp/obj64
+            grep -q "file format coff-i386" /tmp/obj32
+          done
+
+          if [ "${{ matrix.flavor }}" = "gplasync" ]; then
+            strings packaging/system32/d3d11.dll | grep -qx 'DXVK_ASYNC'
+            strings packaging/system32/d3d11.dll | grep -q 'gplasync'
+          else
+            if strings packaging/system32/d3d11.dll | grep -qx 'DXVK_ASYNC'; then
+              echo "FATAL: stable build unexpectedly contains GPLAsync"
+              exit 1
+            fi
+          fi
+
+      - name: Package and verify WCP
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.flavor }}" = "stable" ]; then
+            NAME="DXVK-F7-3.1.1-${{ matrix.arch_name }}-stable"
+          else
+            NAME="DXVK-F7-3.1.1-25ca63f1-${{ matrix.arch_name }}-gplasync"
+          fi
+
+          (
+            cd packaging
+            tar -cJf "$GITHUB_WORKSPACE/${NAME}.wcp" \
+              profile.json system32 syswow64
+          )
+
+          tar -tJf "${NAME}.wcp" > wcp.lst
+          for entry in \
+            profile.json \
+            system32/d3d8.dll system32/d3d9.dll system32/d3d10core.dll system32/d3d11.dll system32/dxgi.dll \
+            syswow64/d3d8.dll syswow64/d3d9.dll syswow64/d3d10core.dll syswow64/d3d11.dll syswow64/dxgi.dll; do
+            grep -qx "$entry" wcp.lst
+          done
+
+          sha256sum "${NAME}.wcp" > "${NAME}.sha256"
+          cat > "${NAME}-BUILD.txt" <<EOF
+          DXVK-F7
+          flavor=${{ matrix.flavor }}
+          arch=${{ matrix.arch_name }}
+          dxvk_ref=${{ matrix.source_ref }}
+          components_patch_ref=${COMPONENTS_REF}
+          llvm_mingw=${LLVM_MINGW_VERSION}
+          arm64_tuning=$([ "${{ matrix.arch_name }}" = "arm64ec" ] && echo "armv8.2-a,cortex-a720" || echo "none; Box64-F7 handles ARM translation")
+          d3d8_mapped=yes
+          EOF
+
+          cat "${NAME}.sha256"
+          ls -lh "${NAME}.wcp"
+
+      - name: Upload DXVK-F7 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DXVK-F7-${{ matrix.flavor }}-${{ matrix.arch_name }}
+          path: |
+            DXVK-F7-*.wcp
+            DXVK-F7-*.sha256
+            DXVK-F7-*-BUILD.txt
+          retention-days: 30
+          if-no-files-found: error
