@@ -1,0 +1,22 @@
+{
+  "name": "WinNative POCO F7 bootstrap",
+  "version": "0.1",
+  "targets": [
+    {
+      "component": "Box64",
+      "ref": "51b5f8cfc2234c45238bbb90f6e23ff6f2ca0fd6",
+      "output": "Box64-F7-0.4.5-51b5f8cfc.wcp"
+    },
+    {
+      "component": "WOWBox64",
+      "ref": "51b5f8cfc2234c45238bbb90f6e23ff6f2ca0fd6",
+      "output": "WOWBox64-F7-0.4.5-51b5f8cfc.wcp"
+    },
+    {
+      "component": "FEXCore",
+      "ref": "FEX-2609",
+      "output": "FEXCore-F7-2609-arm64ec.wcp"
+    }
+  ],
+  "notes": "Baseline only; performance claims require POCO F7 A/B validation."
+}
